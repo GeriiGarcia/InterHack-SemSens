@@ -87,6 +87,10 @@ MASTER_PORT = 8080
 CAM_CONFIDENCE = 0.4   # Threshold de confiança (40%)
 CAM_DEBOUNCE   = 0.5   # Segons entre deteccions repetides de la mateixa classe
 
+# Mode de testing: True = simula la càmera sense Brick real
+# Seqüència: cotxes passant 10s → pato esperant → VERMELL → pato caminant → VERD
+TESTING_SLAVE = False
+
 # ---------------------------------------------------------------------------
 # Utilitat de xarxa
 # ---------------------------------------------------------------------------
@@ -110,8 +114,6 @@ def get_local_ip() -> str:
 CLASSE_A_OBJECTE: dict[str, tuple[str, str]] = {
     "cotxe_esperant": ("cotxe", "esperant"),
     "cotxe_passant":  ("cotxe", "passant"),
-    "cotxe_parat":    ("cotxe", "parat"),
-    "cotxe_caminant": ("cotxe", "caminant"),
     "pato_esperant":  ("pato",  "esperant"),
     "pato_passant":   ("pato",  "passant"),
     "pato_caminant":  ("pato",  "caminant"),
@@ -413,6 +415,99 @@ def send_camera_data() -> None:
 
 
 # ===========================================================================
+# MODE TESTING — Simulació de càmera sense Brick real
+# ===========================================================================
+
+def _sim_inject(zona: int, detections: dict) -> None:
+    """
+    Injecta deteccions simulades seguint el mateix camí que la càmera real:
+      - Zona pròpia del SLAVE (SLAVE_ZONA): via _callback_slave → loop() envia HTTP
+      - Zona 1 en rol MASTER:               via _callback_master → estat directe
+      - Zones creuades:                     via HTTP POST al Master
+    """
+    if ROLE == "SLAVE" and zona == SLAVE_ZONA:
+        _callback_slave(detections)
+
+    elif ROLE == "MASTER" and zona == 1:
+        _callback_master(detections)
+
+    else:
+        # Zona que no és la pròpia: enviem via HTTP igual que un SLAVE real
+        objectes = detections_to_objectes(detections)
+        url      = f"http://{MASTER_IP}:{MASTER_PORT}/api/camera-data"
+        payload  = {"slave": 0, "zona": zona, "objectes": objectes}  # slave=0 = simulat
+        try:
+            requests.post(url, json=payload, timeout=2)
+        except Exception as e:
+            print(f"[TEST] Error enviant zona {zona} al Master: {e}")
+
+
+def _sim_zona(zona: int) -> None:
+    """
+    Simula la seqüència completa per a UNA zona:
+      1. Cotxes passant      (10s — 2 ticks × 5s)
+      2. Pato esperant       ( 5s — 1 tick)
+      3. Cotxes aturats      ( 5s — 1 tick)  → semàfor VERMELL
+      4. Pato caminant       (10s — 2 ticks × 5s)
+      5. Zona neta           ( 5s — 1 tick)
+    Total per zona: ~35s
+    """
+    print(f"\n[TEST] ── Zona {zona} ──────────────────────────────────")
+
+    # 1. Cotxes passant (10s)
+    print(f"[TEST] Z{zona} ▸ cotxes passant (10s)")
+    for _ in range(2):
+        _sim_inject(zona, {"cotxe_passant": 0.99})
+        time.sleep(5)
+
+    # 2. Pato apareix + cotxes segueixen passant (5s)
+    print(f"[TEST] Z{zona} ▸ pato esperant + cotxes passant (5s)")
+    _sim_inject(zona, {"cotxe_passant": 0.99, "pato_esperant": 0.99})
+    time.sleep(5)
+
+    # 3. Cotxes s'aturen + pato segueix esperant → VERMELL (5s)
+    print(f"[TEST] Z{zona} ▸ cotxes aturats + pato esperant → VERMELL (5s)")
+    _sim_inject(zona, {"cotxe_esperant": 0.99, "pato_esperant": 0.99})
+    time.sleep(5)
+
+    # 4. Pato caminant + cotxes aturats (10s)
+    print(f"[TEST] Z{zona} ▸ pato caminant + cotxes aturats (10s)")
+    for _ in range(2):
+        _sim_inject(zona, {"cotxe_esperant": 0.99, "pato_caminant": 0.99})
+        time.sleep(5)
+
+    # 5. Zona neta (5s)
+    print(f"[TEST] Z{zona} ▸ zona neta (5s)")
+    _sim_inject(zona, {})
+    time.sleep(5)
+
+
+def _run_simulation() -> None:
+    """
+    Thread de simulació (TESTING_SLAVE=True).
+    Bucle infinit: primer Z1, després Z2, entre cicles 20s d'alternança.
+    """
+    time.sleep(5)  # Esperar Flask
+
+    cicle = 1
+    while True:
+        print(f"\n[TEST] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print(f"[TEST]  CICLE #{cicle}")
+        print(f"[TEST] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+        # Primer Zona 1, després Zona 2
+        _sim_zona(1)
+        _sim_zona(2)
+
+        # Alternança de 20s sense patos (semàfors es turnen sols)
+        print(f"\n[TEST] Z1 i Z2 netes — alternança automàtica 20s")
+        time.sleep(20)
+
+        print(f"[TEST] ─── Cicle #{cicle} completat ───")
+        cicle += 1
+
+
+# ===========================================================================
 # BUCLE PRINCIPAL (user_loop per a App.run)
 # ===========================================================================
 
@@ -443,7 +538,8 @@ def main() -> None:
           f"Brick: {BRICK_AVAILABLE} | Bridge: {BRIDGE_AVAILABLE}")
     print(f"{'=' * 60}\n")
 
-    detector = _crear_detector()
+    # No inicialitzar el Brick si estem en mode testing
+    detector = None if TESTING_SLAVE else _crear_detector()
 
     if ROLE == "MASTER":
         real_ip = get_local_ip()
@@ -466,13 +562,19 @@ def main() -> None:
         print(f"[SLAVE {SLAVE_ID}] Zona assignada: {SLAVE_ZONA}")
         print(f"[SLAVE {SLAVE_ID}] Enviant dades a: http://{MASTER_IP}:{MASTER_PORT}\n")
 
-        if detector:
+        if TESTING_SLAVE:
+            print(f"[SLAVE {SLAVE_ID}] 🧪 Mode testing actiu — càmera simulada.")
+        elif detector:
             # El SLAVE observa la seva zona i acumula les deteccions
             detector.on_detect_all(_callback_slave)
             detector.start()
             print(f"[SLAVE {SLAVE_ID}] 📷 Càmera (Zona {SLAVE_ZONA}) iniciada via Brick.")
         else:
             print(f"[SLAVE {SLAVE_ID}] ⚠️  Sense Brick — les deteccions seran buides.")
+
+    # Arrancar thread de simulació si TESTING_SLAVE=True (per a qualsevol rol)
+    if TESTING_SLAVE:
+        threading.Thread(target=_run_simulation, daemon=True).start()
 
     # App.run() manté els threads del Brick actius i crida loop() periòdicament.
     # En entorn local (sense App Lab) simulem el comportament manualment.
