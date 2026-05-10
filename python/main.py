@@ -139,115 +139,88 @@ def detections_to_objectes(detections: dict) -> list[dict]:
 
 
 # ===========================================================================
-# ESTAT GLOBAL DEL SISTEMA
+# ESTAT GLOBAL DEL SISTEMA (INTERSECCIÓ)
 # ===========================================================================
-# Per zona: clau = zona_id (int)
-# {
-#   "objectes":            list[dict],   # deteccions actuals
-#   "semafor":             "VERD" | "VERMELL",
-#   "vermell_des_de":      float | None, # timestamp inici vermell
-#   "pato_esperant_des_de":float | None, # timestamp 1er pato esperant
-#   "actualitzat":         float,        # timestamp darrera actualització
-# }
+# Regla fonamental: exactament UNA zona en VERD, l'altra en VERMELL.
+# Controlat per active_zone.
+
 estat_zones: dict[int, dict] = {
-    1: {
-        "objectes": [],
-        "semafor": "VERD",
-        "vermell_des_de": None,
-        "pato_esperant_des_de": None,
-        "actualitzat": 0.0,
-    },
-    2: {
-        "objectes": [],
-        "semafor": "VERD",
-        "vermell_des_de": None,
-        "pato_esperant_des_de": None,
-        "actualitzat": 0.0,
-    },
+    1: {"objectes": [], "semafor": "VERD",    "actualitzat": 0.0},
+    2: {"objectes": [], "semafor": "VERMELL", "actualitzat": 0.0},
 }
 
 estat_lock = threading.Lock()
+call_logs:  list[dict] = []
 
-# Historial d'esdeveniments per al dashboard
-call_logs: list[dict] = []
+# --- Estat d'intersecció ---
+active_zone:        int                    = 1     # zona amb VERD
+last_zone_switch:   float                  = 0.0   # timestamp darrer canvi
+duck_waiting_since: dict[int, float | None] = {1: None, 2: None}
+
+ZONE_ALTERNATE_SEC = 20    # alternança automàtica sense patos (s)
+DUCK_SWITCH_DELAY  = 2.0   # retard des que apareix pato fins posar VERMELL (s)
 
 
 # ===========================================================================
-# ALGORITME DE SEMÀFORS
+# ALGORITME D'INTERSECCIÓ
 # ===========================================================================
+# Cridar SEMPRE amb estat_lock adquirit.
 
-MAX_VERMELL_SEG     = 60    # Màxim temps en vermell (1 min)
-MAX_ESPERA_PATO_SEG = 120   # Màxim temps que pot esperar un pato (2 min)
-MAX_COTXES_SAFE     = 2     # Cotxes passant considerats "tràfic acceptable"
+def _other(z: int) -> int:
+    return 2 if z == 1 else 1
 
 
 def _compta(objectes: list[dict], tipus: str, estat: str | None = None) -> int:
-    """Compta objectes d'un tipus i estat (estat=None = qualsevol)."""
     return sum(
         1 for o in objectes
         if o["tipus"] == tipus and (estat is None or o["estat"] == estat)
     )
 
 
-def actualitzar_semafor(zona_id: int) -> None:
+def actualitzar_interseccio() -> None:
     """
-    Aplica l'algoritme per a una zona i actualitza el semàfor.
-    S'ha d'executar AMB estat_lock adquirit.
-    Crida enviar_ordre_mcu si l'estat canvia.
+    Algoritme principal. Garanteix: exactament 1 zona VERD.
+
+    Prioritats:
+      1. Pato esperant a la zona activa (VERD) → switch després de DUCK_SWITCH_DELAY.
+      2. Sense patos → alternar cada ZONE_ALTERNATE_SEC.
     """
-    z   = estat_zones[zona_id]
-    ara = time.time()
-    obj = z["objectes"]
+    global active_zone, last_zone_switch
+    now = time.time()
 
-    cotxes_passant = _compta(obj, "cotxe", "passant")
-    patos_esperant = _compta(obj, "pato",  "esperant")
-    patos_passant  = _compta(obj, "pato",  "passant")
+    # 1. Tracking de patos esperant per zona
+    for z in [1, 2]:
+        has_duck = _compta(estat_zones[z]["objectes"], "pato", "esperant") > 0
+        if has_duck:
+            if duck_waiting_since[z] is None:
+                duck_waiting_since[z] = now
+        else:
+            duck_waiting_since[z] = None
 
-    # Registra quan va arribar el primer pato esperant
-    if patos_esperant > 0:
-        if z["pato_esperant_des_de"] is None:
-            z["pato_esperant_des_de"] = ara
-    else:
-        z["pato_esperant_des_de"] = None
+    # 2. Pato a la zona activa → switch després del delay
+    switched = False
+    if duck_waiting_since[active_zone] is not None:
+        elapsed = now - duck_waiting_since[active_zone]
+        if elapsed >= DUCK_SWITCH_DELAY:
+            active_zone      = _other(active_zone)
+            last_zone_switch = now
+            switched         = True
 
-    estat_anterior = z["semafor"]
+    # 3. Sense patos a cap zona → alternança periòdica
+    if not switched:
+        any_duck = any(duck_waiting_since[z] is not None for z in [1, 2])
+        if not any_duck and (now - last_zone_switch) >= ZONE_ALTERNATE_SEC:
+            active_zone      = _other(active_zone)
+            last_zone_switch = now
 
-    if z["semafor"] == "VERMELL":
-        temps_vermell      = ara - z["vermell_des_de"]
-        tot_net            = patos_esperant == 0 and patos_passant == 0
-        timeout_vermell    = temps_vermell >= MAX_VERMELL_SEG
-
-        if tot_net or timeout_vermell:
-            z["semafor"]        = "VERD"
-            z["vermell_des_de"] = None
-            z["pato_esperant_des_de"] = None
-
-    else:  # VERD
-        posar_vermell = False
-
-        if patos_esperant > 0:
-            if cotxes_passant == 0:
-                posar_vermell = True               # Sense cotxes: prioritat immediata
-            else:
-                temps_espera          = ara - z["pato_esperant_des_de"] \
-                                        if z["pato_esperant_des_de"] else 0
-                pato_ha_esperat_massa = temps_espera >= MAX_ESPERA_PATO_SEG
-                trafic_acceptable     = cotxes_passant <= MAX_COTXES_SAFE
-
-                if pato_ha_esperat_massa or trafic_acceptable:
-                    posar_vermell = True
-
-        if patos_passant > 0:
-            posar_vermell = True                   # Pato ja passant: no interrompre
-
-        if posar_vermell:
-            z["semafor"] = "VERMELL"
-            if z["vermell_des_de"] is None:
-                z["vermell_des_de"] = ara
-
-    if z["semafor"] != estat_anterior:
-        print(f"[SEMAFOR Z{zona_id}] {estat_anterior} → {z['semafor']}")
-        enviar_ordre_mcu(zona_id, z["semafor"])
+    # 4. Aplicar semàfors i notificar MCU si han canviat
+    for z in [1, 2]:
+        new_sem = "VERD" if z == active_zone else "VERMELL"
+        old_sem = estat_zones[z]["semafor"]
+        estat_zones[z]["semafor"] = new_sem
+        if new_sem != old_sem:
+            print(f"[SEMAFOR Z{z}] {old_sem} → {new_sem}")
+            enviar_ordre_mcu(z, new_sem)
 
 
 def enviar_ordre_mcu(zona_id: int, estat: str) -> None:
@@ -266,7 +239,7 @@ def enviar_ordre_mcu(zona_id: int, estat: str) -> None:
 # CÀMERA — Brick VideoObjectDetection
 # ===========================================================================
 
-def _crear_detector() -> "VideoObjectDetection | None":
+def _crear_detector(preview: bool = False) -> "VideoObjectDetection | None":
     """Inicialitza el Brick de detecció. Retorna None si no disponible."""
     if not BRICK_AVAILABLE:
         print("[CAM] Brick VideoObjectDetection no disponible (entorn local).")
@@ -275,26 +248,19 @@ def _crear_detector() -> "VideoObjectDetection | None":
         camera=None,                # Càmera per defecte (USB)
         confidence=CAM_CONFIDENCE,
         debounce_sec=CAM_DEBOUNCE,
-        camera_preview=False,
+        camera_preview=preview,
     )
     return detector
 
 
 # --- Callback per al MASTER (actualitza Zona 1 directament) ---
 def _callback_master(detections: dict) -> None:
-    """
-    Callback on_detect_all per al MASTER.
-    detections = { "cotxe_esperant": 0.87, "pato_passant": 0.72, ... }
-    """
     objectes = detections_to_objectes(detections)
-
     with estat_lock:
         estat_zones[1]["objectes"]    = objectes
         estat_zones[1]["actualitzat"] = time.time()
-        actualitzar_semafor(1)
-
-    resum = _resum_objectes(objectes)
-    print(f"[CAM MASTER] Zona 1: {resum or 'cap objecte'}")
+        actualitzar_interseccio()
+    print(f"[CAM MASTER] Z1: {_resum_objectes(objectes) or 'buit'}")
 
 
 # --- Callback per al SLAVE (acumula deteccions per enviar-les al MASTER) ---
@@ -371,7 +337,7 @@ def receive_camera_data():
     with estat_lock:
         estat_zones[zona_id]["objectes"]    = objectes
         estat_zones[zona_id]["actualitzat"] = time.time()
-        actualitzar_semafor(zona_id)
+        actualitzar_interseccio()
         semafor_actual = estat_zones[zona_id]["semafor"]
 
     resum = _resum_objectes(objectes) or "cap objecte"
@@ -442,41 +408,69 @@ def _sim_inject(zona: int, detections: dict) -> None:
             print(f"[TEST] Error enviant zona {zona} al Master: {e}")
 
 
+def _get_semafor(zona: int) -> str:
+    """Llegeix l'estat actual del semàfor d'una zona (thread-safe)."""
+    with estat_lock:
+        return estat_zones[zona]["semafor"]
+
+
+def _esperar_semafor(zona: int, estat: str, timeout: float = 30) -> bool:
+    """Espera fins que el semàfor de la zona arribi a l'estat desitjat."""
+    start = time.time()
+    while time.time() - start < timeout:
+        if _get_semafor(zona) == estat:
+            return True
+        time.sleep(0.5)
+    print(f"[TEST] ⚠️  Timeout esperant Z{zona} = {estat}")
+    return False
+
+
 def _sim_zona(zona: int) -> None:
     """
-    Simula la seqüència completa per a UNA zona:
-      1. Cotxes passant      (10s — 2 ticks × 5s)
-      2. Pato esperant       ( 5s — 1 tick)
-      3. Cotxes aturats      ( 5s — 1 tick)  → semàfor VERMELL
-      4. Pato caminant       (10s — 2 ticks × 5s)
-      5. Zona neta           ( 5s — 1 tick)
-    Total per zona: ~35s
+    Simula la seqüència completa per a UNA zona, reactiva al semàfor.
+
+    Pre-condició: la zona HA d'estar en VERD (active_zone == zona).
+    Si no ho està, espera fins que l'alternança periòdica la posi en VERD.
+
+    Seqüència:
+      1. Cotxes passant        (10s) — zona VERD, cotxes circulen
+      2. Pato apareix esperant ( 5s) — cotxes segueixen passant, timer 2s s'inicia
+      3. Espera switch         (...)  — l'algoritme posa zona VERMELL
+      4. Cotxes aturats + pato (10s) — zona VERMELL, cotxes parats, pato creua
+      5. Zona neta             ( 5s) — tot buit
     """
     print(f"\n[TEST] ── Zona {zona} ──────────────────────────────────")
 
-    # 1. Cotxes passant (10s)
-    print(f"[TEST] Z{zona} ▸ cotxes passant (10s)")
+    # 0. Assegurar que la zona està en VERD abans de començar
+    if _get_semafor(zona) != "VERD":
+        print(f"[TEST] Z{zona} ▸ esperant que el semàfor es posi VERD...")
+        _esperar_semafor(zona, "VERD")
+
+    # 1. Cotxes passant — semàfor VERD (10s)
+    print(f"[TEST] Z{zona} ▸ 🟢 cotxes passant (10s)")
     for _ in range(2):
         _sim_inject(zona, {"cotxe_passant": 0.99})
         time.sleep(5)
 
-    # 2. Pato apareix + cotxes segueixen passant (5s)
-    print(f"[TEST] Z{zona} ▸ pato esperant + cotxes passant (5s)")
+    # 2. Pato apareix + cotxes segueixen passant — semàfor encara VERD (5s)
+    #    L'algoritme comença el timer de 2s (DUCK_SWITCH_DELAY)
+    print(f"[TEST] Z{zona} ▸ 🟢 pato esperant + cotxes passant (5s)")
     _sim_inject(zona, {"cotxe_passant": 0.99, "pato_esperant": 0.99})
     time.sleep(5)
 
-    # 3. Cotxes s'aturen + pato segueix esperant → VERMELL (5s)
-    print(f"[TEST] Z{zona} ▸ cotxes aturats + pato esperant → VERMELL (5s)")
-    _sim_inject(zona, {"cotxe_esperant": 0.99, "pato_esperant": 0.99})
-    time.sleep(5)
+    # 3. Esperar que l'algoritme faci el switch (VERMELL)
+    #    El loop() crida actualitzar_interseccio() cada 1s → detecta pato → switch
+    print(f"[TEST] Z{zona} ▸ esperant switch a VERMELL...")
+    _esperar_semafor(zona, "VERMELL")
+    print(f"[TEST] Z{zona} ▸ 🔴 semàfor VERMELL — cotxes s'aturen")
 
-    # 4. Pato caminant + cotxes aturats (10s)
-    print(f"[TEST] Z{zona} ▸ pato caminant + cotxes aturats (10s)")
+    # 4. Cotxes aturats + pato creuant — semàfor VERMELL (10s)
+    print(f"[TEST] Z{zona} ▸ 🔴 pato caminant + cotxes aturats (10s)")
     for _ in range(2):
         _sim_inject(zona, {"cotxe_esperant": 0.99, "pato_caminant": 0.99})
         time.sleep(5)
 
-    # 5. Zona neta (5s)
+    # 5. Zona neta (5s) — pato ha creuat, cotxes marxen
     print(f"[TEST] Z{zona} ▸ zona neta (5s)")
     _sim_inject(zona, {})
     time.sleep(5)
@@ -495,8 +489,10 @@ def _run_simulation() -> None:
         print(f"[TEST]  CICLE #{cicle}")
         print(f"[TEST] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-        # Primer Zona 1, després Zona 2
+        # Primer Zona 1 (ha d'estar en VERD al inici)
         _sim_zona(1)
+
+        # Ara Z2 és VERD (el switch del pato Z1 l'ha posat)
         _sim_zona(2)
 
         # Alternança de 20s sense patos (semàfors es turnen sols)
@@ -512,12 +508,10 @@ def _run_simulation() -> None:
 # ===========================================================================
 
 def loop() -> None:
-    """Executat repetidament pel framework. Re-avalua l'algoritme per timeouts."""
-    if ROLE == "MASTER":
-        # Re-evaluar periòdicament per gestionar timeouts (2-min pato, 1-min vermell)
+    """Re-avalua la intersecció periòdicament (alternança 20s, timeouts)."""
+    if ROLE == "MASTER" or TESTING_SLAVE:
         with estat_lock:
-            for zona_id in estat_zones:
-                actualitzar_semafor(zona_id)
+            actualitzar_interseccio()
         time.sleep(1)
 
     elif ROLE == "SLAVE":
@@ -532,14 +526,26 @@ def loop() -> None:
 # ===========================================================================
 
 def main() -> None:
+    global last_zone_switch
+    last_zone_switch = time.time()  # Inicialitzar el rellotge d'alternança
+
     print(f"\n{'=' * 60}")
     print(f"  Sistema de Semàfors Intel·ligent — Arduino UNO Q")
     print(f"  Rol: {ROLE} | App Lab: {USING_APP_RUNNER} | "
           f"Brick: {BRICK_AVAILABLE} | Bridge: {BRIDGE_AVAILABLE}")
     print(f"{'=' * 60}\n")
 
-    # No inicialitzar el Brick si estem en mode testing
-    detector = None if TESTING_SLAVE else _crear_detector()
+    if TESTING_SLAVE:
+        # En mode testing: encendre la càmera amb preview (per rollear)
+        # però SENSE registrar callback → les deteccions venen de la simulació
+        detector = _crear_detector(preview=True)
+        if detector:
+            detector.start()
+            print(f"[SLAVE {SLAVE_ID}] 📷 Càmera encesa (preview) — deteccions simulades.")
+        else:
+            print(f"[SLAVE {SLAVE_ID}] 🧪 Mode testing — sense càmera disponible.")
+    else:
+        detector = _crear_detector()
 
     if ROLE == "MASTER":
         real_ip = get_local_ip()
@@ -550,26 +556,22 @@ def main() -> None:
         # Flask en thread separat (daemon)
         threading.Thread(target=run_flask_server, daemon=True).start()
 
-        if detector:
-            # El MASTER observa la Zona 1 amb la seva pròpia càmera
+        if not TESTING_SLAVE and detector:
             detector.on_detect_all(_callback_master)
             detector.start()
             print("[MASTER] 📷 Càmera (Zona 1) iniciada via Brick VideoObjectDetection.")
-        else:
+        elif not TESTING_SLAVE:
             print("[MASTER] ⚠️  Sense Brick — Zona 1 s'actualitzarà via /api/camera-data.")
 
     elif ROLE == "SLAVE":
         print(f"[SLAVE {SLAVE_ID}] Zona assignada: {SLAVE_ZONA}")
         print(f"[SLAVE {SLAVE_ID}] Enviant dades a: http://{MASTER_IP}:{MASTER_PORT}\n")
 
-        if TESTING_SLAVE:
-            print(f"[SLAVE {SLAVE_ID}] 🧪 Mode testing actiu — càmera simulada.")
-        elif detector:
-            # El SLAVE observa la seva zona i acumula les deteccions
+        if not TESTING_SLAVE and detector:
             detector.on_detect_all(_callback_slave)
             detector.start()
             print(f"[SLAVE {SLAVE_ID}] 📷 Càmera (Zona {SLAVE_ZONA}) iniciada via Brick.")
-        else:
+        elif not TESTING_SLAVE:
             print(f"[SLAVE {SLAVE_ID}] ⚠️  Sense Brick — les deteccions seran buides.")
 
     # Arrancar thread de simulació si TESTING_SLAVE=True (per a qualsevol rol)
