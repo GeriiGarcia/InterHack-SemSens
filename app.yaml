@@ -1,0 +1,9 @@
+name: dfpknasdjkawd
+description: ""
+ports:
+- 8000
+- 8080
+bricks:
+- arduino:video_object_detection: {}
+- arduino:web_ui: {}
+icon: 😀
